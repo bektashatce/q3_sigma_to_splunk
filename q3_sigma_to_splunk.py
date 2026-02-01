@@ -12,8 +12,13 @@ from typing import Any, Dict, List, Tuple
 import requests
 import yaml
 
+
 def ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+
+def utc_iso() -> str:
+    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
 
 
 def die(msg: str) -> None:
@@ -21,7 +26,6 @@ def die(msg: str) -> None:
 
 
 def spl_quote(v: str) -> str:
-    """Safely quote a value for SPL double-quoted strings."""
     v = v.replace("\\", "\\\\").replace('"', '\\"')
     return f"\"{v}\""
 
@@ -31,12 +35,15 @@ def load_yaml(path: str) -> Dict[str, Any]:
         return yaml.safe_load(f) or {}
 
 
-def utc_iso() -> str:
-    return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
-
-
 def sanitize_filename(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_\-]+", "_", s)[:120] or "rule"
+
+
+def wrap_contains(value: str) -> str:
+    if "*" in value:
+        return value
+    return f"*{value}*"
+
 
 def load_rule_files(rule_file: str, rules_dir: str) -> List[str]:
     paths: List[str] = []
@@ -56,6 +63,7 @@ def load_rule_files(rule_file: str, rules_dir: str) -> List[str]:
             seen.add(ap)
             out.append(p)
     return out
+
 
 def normalize_logsource(rule: Dict[str, Any]) -> Dict[str, str]:
     logsource = rule.get("logsource", {}) or {}
@@ -79,19 +87,11 @@ def normalize_logsource(rule: Dict[str, Any]) -> Dict[str, str]:
 
     return out
 
+
 RegexFilter = Tuple[str, str]
-def _wrap_contains(value: str) -> str:
-    """Wrap with *...* unless the value already contains a wildcard."""
-    if "*" in value:
-        return value
-    return f"*{value}*"
 
 
 def build_field_expr(field: str, value: Any) -> Tuple[str, List[RegexFilter]]:
-    """
-    Convert a Sigma field/value to SPL boolean expression.
-    Returns (spl_expr, regex_filters)
-    """
     regex_filters: List[RegexFilter] = []
 
     if isinstance(value, list):
@@ -111,12 +111,11 @@ def build_field_expr(field: str, value: Any) -> Tuple[str, List[RegexFilter]]:
     s = str(value)
 
     if field == "_raw":
-        return f"_raw={spl_quote(_wrap_contains(s))}", regex_filters
+        return f"_raw={spl_quote(wrap_contains(s))}", regex_filters
 
-    # Robust EventID/EventCode matching
     if field.lower() in ("eventid", "eventcode") and s.isdigit():
         xml_pat = f"*<EventID>{s}</EventID>*"
-        return f'(EventCode={s} OR EventID={s} OR _raw={spl_quote(xml_pat)})', regex_filters
+        return f"(EventCode={s} OR EventID={s} OR _raw={spl_quote(xml_pat)})", regex_filters
 
     return f"{field}={spl_quote(s)}", regex_filters
 
@@ -136,13 +135,15 @@ def convert_selection(selection: Dict[str, Any]) -> Tuple[str, List[RegexFilter]
                 parts = []
                 for v in vals:
                     v = str(v)
-                    parts.append(f'(ps_script={spl_quote(_wrap_contains(v))} OR _raw={spl_quote(_wrap_contains(v))})')
+                    parts.append(
+                        f"(ps_script={spl_quote(wrap_contains(v))} OR _raw={spl_quote(wrap_contains(v))})"
+                    )
                 clauses.append("(" + " OR ".join(parts) + ")")
                 continue
 
             if mod == "contains":
                 vals = raw_val if isinstance(raw_val, list) else [raw_val]
-                parts = [f'{field}={spl_quote(_wrap_contains(str(v)))}' for v in vals]
+                parts = [f'{field}={spl_quote(wrap_contains(str(v)))}' for v in vals]
                 clauses.append("(" + " OR ".join(parts) + ")")
                 continue
 
@@ -208,7 +209,7 @@ def sigma_to_search_expr(rule: Dict[str, Any]) -> Tuple[str, List[RegexFilter]]:
             continue
 
         if not isinstance(val, dict):
-            selections_spl[key] = f'_raw={spl_quote(_wrap_contains(str(val)))}'
+            selections_spl[key] = f'_raw={spl_quote(wrap_contains(str(val)))}'
             continue
 
         sel_spl, rf = convert_selection(val)
@@ -219,6 +220,7 @@ def sigma_to_search_expr(rule: Dict[str, Any]) -> Tuple[str, List[RegexFilter]]:
 
     base_expr = sigma_condition_to_spl(condition, selections_spl)
     return base_expr, regex_filters
+
 
 def build_full_spl(rule: Dict[str, Any]) -> str:
     ls = normalize_logsource(rule)
@@ -232,12 +234,10 @@ def build_full_spl(rule: Dict[str, Any]) -> str:
     st = (ls.get("sourcetype") or "").lower()
 
     if "powershell/operational" in st:
-        # NOTE: Use double-quoted Python string so [\"'] doesn't break Python syntax
         spl_parts.append(
-            r"""| rex field=_raw max_match=1 "<Data Name=[\"']ScriptBlockText[\"']>(?<ps_script>[\s\S]*?)</Data>" """
-            .strip()
+            r"""| rex field=_raw max_match=1 "<Data Name=[\"']ScriptBlockText[\"']>(?<ps_script>[\s\S]*?)</Data>" """.strip()
         )
-     
+
     if "sysmon/operational" in st:
         spl_parts.append(r"""| rex field=_raw "<Data Name=[\"']Image[\"']>(?<Image>[^<]+)</Data>" """.strip())
         spl_parts.append(r"""| rex field=_raw "<Data Name=[\"']CommandLine[\"']>(?<CommandLine>[^<]+)</Data>" """.strip())
@@ -255,7 +255,6 @@ def build_full_spl(rule: Dict[str, Any]) -> str:
         spl_parts.append("| table _time host ps_script _raw")
         spl_parts.append("| sort - _time")
     elif "sysmon/operational" in st:
-        # Include triage fields for EID 1 + TargetFilename for EID 11 (blank if not present)
         spl_parts.append("| table _time host User Image CommandLine ParentImage ParentCommandLine TargetFilename _raw")
         spl_parts.append("| sort - _time")
     else:
@@ -263,6 +262,7 @@ def build_full_spl(rule: Dict[str, Any]) -> str:
         spl_parts.append("| sort - _time")
 
     return " ".join(spl_parts)
+
 
 class SplunkClient:
     def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool):
@@ -319,15 +319,22 @@ class SplunkClient:
                 continue
         return results
 
+
 def print_top_table(results: List[Dict[str, Any]], top_n: int = 3) -> None:
     top = results[:top_n]
     if not top:
         return
 
     preferred = [
-        "_time", "host", "User", "Image", "CommandLine",
-        "ParentImage", "ParentCommandLine", "TargetFilename",
-        "ps_script"
+        "_time",
+        "host",
+        "User",
+        "Image",
+        "CommandLine",
+        "ParentImage",
+        "ParentCommandLine",
+        "TargetFilename",
+        "ps_script",
     ]
     cols = [c for c in preferred if any(c in r for r in top)]
     if not cols:
@@ -349,6 +356,7 @@ def export_json_results(results: List[Dict[str, Any]], outdir: str, rule_id: str
     with open(path, "w", encoding="utf-8") as f:
         json.dump(results, f, ensure_ascii=False, indent=2)
     return path
+
 
 def run_once(
     client: SplunkClient,
@@ -390,7 +398,7 @@ def run_once(
 
 
 def main() -> None:
-    ap = argparse.ArgumentParser(description="Q3 Sigma -> Splunk automation (oneshot + scheduled rolling window)")
+    ap = argparse.ArgumentParser(description="Q3 Sigma to Splunk automation (oneshot and scheduled rolling window)")
     ap.add_argument("--rule-file", default="", help="Single sigma rule file (optional)")
     ap.add_argument("--rules-dir", default="rules", help="Folder containing sigma rules")
     ap.add_argument("--outdir", default="out", help="Output folder for JSON match exports")
@@ -399,7 +407,6 @@ def main() -> None:
     ap.add_argument("--interval-seconds", type=int, default=300)
     ap.add_argument("--max-runs", type=int, default=0)
     ap.add_argument("--lookback-days", type=int, default=10, help="Rolling window in days for scheduled mode")
-
     ap.add_argument("--top-n", type=int, default=3)
     args = ap.parse_args()
 
@@ -430,18 +437,20 @@ def main() -> None:
         print(f"[{ts()}] Oneshot window: earliest={default_earliest} latest={default_latest}")
         run_once(client, rule_paths, args.outdir, default_earliest, default_latest, args.top_n)
         return
+
     lookback_days = max(1, int(args.lookback_days))
     earliest_rel = f"-{lookback_days}d"
     latest_rel = "now"
 
-    print(f"[{ts()}] Scheduled interval={args.interval_seconds}s max_runs={args.max_runs or 'forever'}")
+    max_runs_label = str(args.max_runs) if args.max_runs else "forever"
+    print(f"[{ts()}] Scheduled interval={args.interval_seconds}s max_runs={max_runs_label}")
     print(f"[{ts()}] Rolling window: earliest={earliest_rel} latest={latest_rel}")
 
     run_count = 0
     try:
         while True:
             run_count += 1
-            print("\n" + "#" * 78)
+            print("\n" + "=" * 78)
             print(f"[{ts()}] Scheduled cycle {run_count} started (utc={utc_iso()})")
 
             run_once(client, rule_paths, args.outdir, earliest_rel, latest_rel, args.top_n)
@@ -459,4 +468,3 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
-
