@@ -12,10 +12,6 @@ from typing import Any, Dict, List, Tuple
 import requests
 import yaml
 
-
-# =========================
-# Helpers
-# =========================
 def ts() -> str:
     return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
@@ -42,10 +38,6 @@ def utc_iso() -> str:
 def sanitize_filename(s: str) -> str:
     return re.sub(r"[^a-zA-Z0-9_\-]+", "_", s)[:120] or "rule"
 
-
-# =========================
-# Rule file loading
-# =========================
 def load_rule_files(rule_file: str, rules_dir: str) -> List[str]:
     paths: List[str] = []
 
@@ -65,10 +57,6 @@ def load_rule_files(rule_file: str, rules_dir: str) -> List[str]:
             out.append(p)
     return out
 
-
-# =========================
-# Logsource mapping
-# =========================
 def normalize_logsource(rule: Dict[str, Any]) -> Dict[str, str]:
     logsource = rule.get("logsource", {}) or {}
     product = (logsource.get("product") or "").lower()
@@ -91,13 +79,7 @@ def normalize_logsource(rule: Dict[str, Any]) -> Dict[str, str]:
 
     return out
 
-
-# =========================
-# Sigma -> SPL conversion
-# =========================
 RegexFilter = Tuple[str, str]
-
-
 def _wrap_contains(value: str) -> str:
     """Wrap with *...* unless the value already contains a wildcard."""
     if "*" in value:
@@ -128,7 +110,6 @@ def build_field_expr(field: str, value: Any) -> Tuple[str, List[RegexFilter]]:
 
     s = str(value)
 
-    # IMPORTANT: treat _raw as "contains" by default
     if field == "_raw":
         return f"_raw={spl_quote(_wrap_contains(s))}", regex_filters
 
@@ -150,7 +131,6 @@ def convert_selection(selection: Dict[str, Any]) -> Tuple[str, List[RegexFilter]
             field = field.strip()
             mod = mod.strip().lower()
 
-            # ScriptBlockText often not parsed -> ps_script + _raw fallback for contains
             if field == "ScriptBlockText" and mod == "contains":
                 vals = raw_val if isinstance(raw_val, list) else [raw_val]
                 parts = []
@@ -240,10 +220,6 @@ def sigma_to_search_expr(rule: Dict[str, Any]) -> Tuple[str, List[RegexFilter]]:
     base_expr = sigma_condition_to_spl(condition, selections_spl)
     return base_expr, regex_filters
 
-
-# =========================
-# SPL augmentation (rex + tables)
-# =========================
 def build_full_spl(rule: Dict[str, Any]) -> str:
     ls = normalize_logsource(rule)
     prefix = f'index={ls["index"]}'
@@ -255,16 +231,13 @@ def build_full_spl(rule: Dict[str, Any]) -> str:
     spl_parts: List[str] = [prefix]
     st = (ls.get("sourcetype") or "").lower()
 
-    # PowerShell Operational: extract ScriptBlockText into ps_script
     if "powershell/operational" in st:
         # NOTE: Use double-quoted Python string so [\"'] doesn't break Python syntax
         spl_parts.append(
             r"""| rex field=_raw max_match=1 "<Data Name=[\"']ScriptBlockText[\"']>(?<ps_script>[\s\S]*?)</Data>" """
             .strip()
         )
-        # IMPORTANT: do NOT filter isnotnull(ps_script) -> keep _raw fallback alive
-
-    # Sysmon Operational: extract common fields (EID 1 triage + EID 11 file create)
+     
     if "sysmon/operational" in st:
         spl_parts.append(r"""| rex field=_raw "<Data Name=[\"']Image[\"']>(?<Image>[^<]+)</Data>" """.strip())
         spl_parts.append(r"""| rex field=_raw "<Data Name=[\"']CommandLine[\"']>(?<CommandLine>[^<]+)</Data>" """.strip())
@@ -273,14 +246,11 @@ def build_full_spl(rule: Dict[str, Any]) -> str:
         spl_parts.append(r"""| rex field=_raw "<Data Name=[\"']User[\"']>(?<User>[^<]+)</Data>" """.strip())
         spl_parts.append(r"""| rex field=_raw "<Data Name=[\"']TargetFilename[\"']>(?<TargetFilename>[^<]+)</Data>" """.strip())
 
-    # Apply Sigma boolean logic
     spl_parts.append(f"| search {base_expr}")
 
-    # Apply regex filters (if any)
     for field, pattern in regex_filters:
         spl_parts.append(f"| regex {field}={spl_quote(pattern)}")
 
-    # Evidence tables
     if "powershell/operational" in st:
         spl_parts.append("| table _time host ps_script _raw")
         spl_parts.append("| sort - _time")
@@ -294,10 +264,6 @@ def build_full_spl(rule: Dict[str, Any]) -> str:
 
     return " ".join(spl_parts)
 
-
-# =========================
-# Splunk REST
-# =========================
 class SplunkClient:
     def __init__(self, base_url: str, username: str, password: str, verify_ssl: bool):
         self.base_url = base_url.rstrip("/")
@@ -353,10 +319,6 @@ class SplunkClient:
                 continue
         return results
 
-
-# =========================
-# Output helpers
-# =========================
 def print_top_table(results: List[Dict[str, Any]], top_n: int = 3) -> None:
     top = results[:top_n]
     if not top:
@@ -388,10 +350,6 @@ def export_json_results(results: List[Dict[str, Any]], outdir: str, rule_id: str
         json.dump(results, f, ensure_ascii=False, indent=2)
     return path
 
-
-# =========================
-# Execution
-# =========================
 def run_once(
     client: SplunkClient,
     rule_paths: List[str],
@@ -472,8 +430,6 @@ def main() -> None:
         print(f"[{ts()}] Oneshot window: earliest={default_earliest} latest={default_latest}")
         run_once(client, rule_paths, args.outdir, default_earliest, default_latest, args.top_n)
         return
-
-    # scheduled rolling uses relative time for UI-like behavior
     lookback_days = max(1, int(args.lookback_days))
     earliest_rel = f"-{lookback_days}d"
     latest_rel = "now"
@@ -503,3 +459,4 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
